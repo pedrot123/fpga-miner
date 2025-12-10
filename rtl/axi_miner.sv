@@ -1,10 +1,14 @@
 // AXI4-Lite wrapper around a Bitcoin double SHA-256 engine.
-// Register map (word addresses, 32-bit):
-// 0x00..0x4C : HEADER[0..19] (80 bytes, big-endian words)
-// 0x50       : CONTROL {bit0=start}
-// 0x54       : STATUS  {bit0=ready, bit1=busy, bit2=hash_valid, bit3=found}
-// 0x58..0x74 : TARGET[0..7] (256-bit comparison target, big-endian)
-// 0x78..0x94 : HASH[0..7]   (latest hash result, big-endian, read-only)
+// Memory map (word addresses, 32-bit each):
+// 0x00...0x4C : HEADER[0..19] (80 bytes)
+// 0x50 : CONTROL {bit0=start}
+// 0x54 : STATUS {bit0=ready, bit1=busy, bit2=hash_valid, bit3=found}
+// 0x58...0x74 : TARGET[0..7] (256-bit comparison target)
+// 0x78...0x94 : HASH[0..7]   (hash result)
+// 8 bit address space to encoupse 0x98 bytes of data total
+// Pulled AXI4-Lite reference from online, adjusted for hashing
+// 4-byte read and writes for AXI4-Lite so multiple reads and writes are needed to write header and read hash
+// If I have extra time, I might explore a more efficient way
 `timescale 1ns/1ps
 module axi_miner #(
     parameter integer C_S_AXI_DATA_WIDTH = 32,
@@ -30,8 +34,10 @@ module axi_miner #(
     output logic                         S_AXI_RVALID,
     input  logic                         S_AXI_RREADY
 );
-    localparam integer ADDR_LSB         = $clog2(C_S_AXI_DATA_WIDTH/8);
-    localparam integer OPT_MEM_ADDR_BITS = C_S_AXI_ADDR_WIDTH-ADDR_LSB;
+    // 4-byte alignment
+    localparam integer ADDR_ALIGNMENT = 2;
+    // Address bits outside alignment
+    localparam integer ADDR_BITS = C_S_AXI_ADDR_WIDTH-ADDR_ALIGNMENT;
 
     logic [C_S_AXI_ADDR_WIDTH-1:0] axi_awaddr;
     logic [C_S_AXI_ADDR_WIDTH-1:0] axi_araddr;
@@ -40,25 +46,27 @@ module axi_miner #(
     // storage
     logic [31:0] header_words [0:19];
     logic [31:0] target_words [0:7];
-    logic [31:0] hash_words   [0:7];
+    logic [31:0] hash_words [0:7];
     logic [31:0] control_reg;
-    logic        start_req;
+    logic start_req;
 
-    logic        hash_flag;
-    logic        found_flag;
+    logic hash_flag;
+    logic found_flag;
 
     // AXI write address channel
     always_ff @(posedge S_AXI_ACLK) begin
         if (!S_AXI_ARESETN) begin
             S_AXI_AWREADY <= 1'b0;
-            aw_en         <= 1'b0;
+            aw_en <= 1'b0;
         end else begin
+            // Start write
             if (!S_AXI_AWREADY && S_AXI_AWVALID && S_AXI_WVALID && !aw_en) begin
                 S_AXI_AWREADY <= 1'b1;
-                aw_en         <= 1'b1;
-                axi_awaddr    <= S_AXI_AWADDR;
+                aw_en <= 1'b1;
+                axi_awaddr <= S_AXI_AWADDR;
+            // End write, can start write again
             end else if (S_AXI_BREADY && S_AXI_BVALID) begin
-                aw_en      <= 1'b0;
+                aw_en <= 1'b0;
                 S_AXI_AWREADY <= 1'b0;
             end else begin
                 S_AXI_AWREADY <= 1'b0;
@@ -71,8 +79,10 @@ module axi_miner #(
         if (!S_AXI_ARESETN) begin
             S_AXI_WREADY <= 1'b0;
         end else begin
+            // Start write
             if (!S_AXI_WREADY && S_AXI_WVALID && S_AXI_AWVALID && !aw_en) begin
                 S_AXI_WREADY <= 1'b1;
+            // End write, can start write again
             end else begin
                 S_AXI_WREADY <= 1'b0;
             end
@@ -83,11 +93,13 @@ module axi_miner #(
     always_ff @(posedge S_AXI_ACLK) begin
         if (!S_AXI_ARESETN) begin
             S_AXI_BVALID <= 1'b0;
-            S_AXI_BRESP  <= 2'b00;
+            S_AXI_BRESP <= 2'b00;
         end else begin
+            // Start write response
             if (S_AXI_AWREADY && S_AXI_AWVALID && S_AXI_WREADY && S_AXI_WVALID && !S_AXI_BVALID) begin
                 S_AXI_BVALID <= 1'b1;
-                S_AXI_BRESP  <= 2'b00;
+                S_AXI_BRESP <= 2'b00;
+            // End write, can start write again
             end else if (S_AXI_BVALID && S_AXI_BREADY) begin
                 S_AXI_BVALID <= 1'b0;
             end
@@ -100,9 +112,11 @@ module axi_miner #(
             S_AXI_ARREADY <= 1'b0;
             axi_araddr    <= {C_S_AXI_ADDR_WIDTH{1'b0}};
         end else begin
+            // Start read
             if (!S_AXI_ARREADY && S_AXI_ARVALID) begin
                 S_AXI_ARREADY <= 1'b1;
-                axi_araddr    <= S_AXI_ARADDR;
+                axi_araddr <= S_AXI_ARADDR;
+            // End read, can read again
             end else begin
                 S_AXI_ARREADY <= 1'b0;
             end
@@ -113,11 +127,13 @@ module axi_miner #(
     always_ff @(posedge S_AXI_ACLK) begin
         if (!S_AXI_ARESETN) begin
             S_AXI_RVALID <= 1'b0;
-            S_AXI_RRESP  <= 2'b00;
+            S_AXI_RRESP <= 2'b00;
         end else begin
+            // Start read data
             if (S_AXI_ARREADY && S_AXI_ARVALID && !S_AXI_RVALID) begin
                 S_AXI_RVALID <= 1'b1;
                 S_AXI_RRESP  <= 2'b00;
+            // End read data, can read data again
             end else if (S_AXI_RVALID && S_AXI_RREADY) begin
                 S_AXI_RVALID <= 1'b0;
             end
@@ -152,29 +168,30 @@ module axi_miner #(
         end else begin
             // auto-clear start after issuing pulse
             if (start_req && miner_ready) begin
-                start_req       <= 1'b0;
-                control_reg[0]  <= 1'b0;
+                start_req <= 1'b0;
+                control_reg[0] <= 1'b0;
             end
 
             if (S_AXI_AWREADY && S_AXI_AWVALID && S_AXI_WREADY && S_AXI_WVALID) begin
-                unique case (axi_awaddr[ADDR_LSB+OPT_MEM_ADDR_BITS-1:ADDR_LSB])
-                    // header region 0x00..0x4C
+                // offset by 2 bits due to alignment accessing
+                unique case (axi_awaddr[C_S_AXI_ADDR_WIDTH-1:ADDR_ALIGNMENT])
+                    // header region 0x00...0x4C
                     6'h00, 6'h01, 6'h02, 6'h03, 6'h04, 6'h05, 6'h06, 6'h07,
                     6'h08, 6'h09, 6'h0A, 6'h0B, 6'h0C, 6'h0D, 6'h0E, 6'h0F,
                     6'h10, 6'h11, 6'h12, 6'h13: begin
                         int idx;
-                        idx = axi_awaddr[ADDR_LSB+OPT_MEM_ADDR_BITS-1:ADDR_LSB];
+                        idx = axi_awaddr[C_S_AXI_ADDR_WIDTH-1:ADDR_ALIGNMENT];
                         header_words[idx] <= apply_wstrb(header_words[idx], S_AXI_WDATA, S_AXI_WSTRB);
                     end
-                    // control at 0x50 -> word offset 0x14
+                    // control at 0x50
                     6'h14: begin
                         control_reg <= apply_wstrb(control_reg, S_AXI_WDATA, S_AXI_WSTRB);
                         start_req   <= S_AXI_WDATA[0];
                     end
-                    // target at 0x58..0x74 -> offsets 0x16..0x1D
+                    // target at 0x58...0x74
                     6'h16,6'h17,6'h18,6'h19,6'h1A,6'h1B,6'h1C,6'h1D: begin
                         int idx;
-                        idx = axi_awaddr[ADDR_LSB+OPT_MEM_ADDR_BITS-1:ADDR_LSB] - 6'h16;
+                        idx = axi_awaddr[C_S_AXI_ADDR_WIDTH-1:ADDR_ALIGNMENT] - 6'h16;
                         target_words[idx] <= apply_wstrb(target_words[idx], S_AXI_WDATA, S_AXI_WSTRB);
                     end
                     default: ;
@@ -186,13 +203,13 @@ module axi_miner #(
     // Read mux
     always_comb begin
         S_AXI_RDATA = 32'd0;
-        unique case (axi_araddr[ADDR_LSB+OPT_MEM_ADDR_BITS-1:ADDR_LSB])
+        unique case (axi_araddr[C_S_AXI_ADDR_WIDTH-1:ADDR_ALIGNMENT])
             // header words
             6'h00, 6'h01, 6'h02, 6'h03, 6'h04, 6'h05, 6'h06, 6'h07,
             6'h08, 6'h09, 6'h0A, 6'h0B, 6'h0C, 6'h0D, 6'h0E, 6'h0F,
             6'h10, 6'h11, 6'h12, 6'h13: begin
                 int idx;
-                idx        = axi_araddr[ADDR_LSB+OPT_MEM_ADDR_BITS-1:ADDR_LSB];
+                idx = axi_araddr[C_S_AXI_ADDR_WIDTH-1:ADDR_ALIGNMENT];
                 S_AXI_RDATA = header_words[idx];
             end
             // control
@@ -202,13 +219,13 @@ module axi_miner #(
             // target
             6'h16,6'h17,6'h18,6'h19,6'h1A,6'h1B,6'h1C,6'h1D: begin
                 int idx;
-                idx        = axi_araddr[ADDR_LSB+OPT_MEM_ADDR_BITS-1:ADDR_LSB] - 6'h16;
+                idx = axi_araddr[C_S_AXI_ADDR_WIDTH-1:ADDR_ALIGNMENT] - 6'h16;
                 S_AXI_RDATA = target_words[idx];
             end
-            // hash output at 0x78..0x94 offsets 0x1E..0x25
+            // hash output at 0x78...0x94
             6'h1E,6'h1F,6'h20,6'h21,6'h22,6'h23,6'h24,6'h25: begin
                 int idx;
-                idx        = axi_araddr[ADDR_LSB+OPT_MEM_ADDR_BITS-1:ADDR_LSB] - 6'h1E;
+                idx = axi_araddr[C_S_AXI_ADDR_WIDTH-1:ADDR_ALIGNMENT] - 6'h1E;
                 S_AXI_RDATA = hash_words[idx];
             end
             default: S_AXI_RDATA = 32'd0;
@@ -219,8 +236,8 @@ module axi_miner #(
     logic [639:0] header_vec;
     logic [255:0] target_vec;
     logic [255:0] miner_hash;
-    logic         miner_ready;
-    logic         miner_hash_valid;
+    logic miner_ready;
+    logic miner_hash_valid;
 
     always_comb begin
         header_vec = '0;
